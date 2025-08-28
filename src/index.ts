@@ -188,22 +188,32 @@ export default {
     const sp = url.searchParams;
     const pathname = url.pathname;
 
-    // --- /encrypt: return encrypted token in plain text ---
+    // --- /encrypt: return encrypted data (plain text) ---
+    // usage: GET /encrypt?raw=<RAW_DATA>&uuid=<UUID_MUST_MATCH_ENV>
     if (pathname === "/encrypt") {
-      const raw = sp.get("token");
+      const raw = sp.get("raw");
+      const provided = sp.get("uuid");
+      const master = env?.uuid;
+
       if (!raw) {
-        return new Response("missing token", {
+        return new Response("missing raw", {
           status: 400,
           headers: { "content-type": "text/plain; charset=utf-8" },
         });
       }
-      const master = env?.uuid;
       if (!master) {
         return new Response("missing uuid", {
           status: 500,
           headers: { "content-type": "text/plain; charset=utf-8" },
         });
       }
+      if (!provided || provided !== master) {
+        return new Response("forbidden", {
+          status: 403,
+          headers: { "content-type": "text/plain; charset=utf-8" },
+        });
+      }
+
       try {
         const enc = await encryptToken(master, raw);
         return new Response(enc, {
@@ -266,10 +276,10 @@ export default {
     // --- /update: DDNS update (provider-agnostic parsing) ---
     if (pathname === "/update") {
       const platform = normalizePlatform(sp.get("platform"));
-      const encToken = sp.get("token");          // encrypted token (from /encrypt)
-      const domain = sp.get("domain")?.trim();    // Single domain (no suffix like .duckdns.org)
-      const ipParam = sp.get("ip");               // IPv4 input: null=keep, ""=use CF IP, "<value>"=set
-      const ipv6Param = sp.get("ipv6");           // IPv6 input: same semantics as above
+      const encToken = sp.get("token");           // encrypted token (from /encrypt)
+      const encDomain = sp.get("domain");         // encrypted domain (from /encrypt)
+      const ipParam = sp.get("ip");               // IPv4: null=keep, ""=use CF IP, "<value>"=set
+      const ipv6Param = sp.get("ipv6");           // IPv6: same semantics
 
       const cfConnectingIp = request.headers.get("CF-Connecting-IP") ?? undefined;
 
@@ -281,11 +291,11 @@ export default {
 
       let ddnsOp:
         | {
-          ok: boolean;
-          providerResponse?: unknown;
-          providerStatus?: number;
-          error?: string;
-        }
+            ok: boolean;
+            providerResponse?: unknown;
+            providerStatus?: number;
+            error?: string;
+          }
         | null = null;
 
       // Validate args before contacting provider
@@ -295,8 +305,8 @@ export default {
         ddnsOp = { ok: false, error: "Invalid or missing platform" };
       } else if (!encToken) {
         ddnsOp = { ok: false, error: "Missing 'token' (encrypted)" };
-      } else if (!domain) {
-        ddnsOp = { ok: false, error: "Missing 'domain'" };
+      } else if (!encDomain) {
+        ddnsOp = { ok: false, error: "Missing 'domain' (encrypted)" };
       } else if (ipv4Choice.update && !ipv4Choice.value) {
         ddnsOp = { ok: false, error: "IPv4 update requested but value is missing" };
       } else if (ipv6Choice.update && !ipv6Choice.value) {
@@ -307,7 +317,9 @@ export default {
           ddnsOp = { ok: false, error: "missing uuid" };
         } else {
           try {
+            // Decrypt both token and domain
             const realDdnsToken = await decryptToken(master, encToken);
+            const domain = await decryptToken(master, encDomain);
             const handler = HANDLERS[platform];
 
             if (!ipv4Choice.update && !ipv6Choice.update) {
@@ -326,17 +338,37 @@ export default {
                 error: inner.error,
               };
             }
+
+            const result = {
+              ok: !!platform && !!encToken && !!ddnsOp?.ok,
+              platform: platform ?? null,
+              token_key_received: redactToken(encToken), // preview only (encrypted)
+              domain,                                     // decrypted domain
+              decisions: { ipv4: ipv4Choice, ipv6: ipv6Choice },
+              ddns_op: ddnsOp,
+              client: {
+                cf_connecting_ip: cfConnectingIp ?? null,
+                user_agent: request.headers.get("user-agent") ?? null,
+              },
+            };
+
+            const statusCode = ddnsOp?.providerStatus ?? (result.ok ? 200 : 400);
+            return new Response(JSON.stringify(result, null, 2), {
+              status: statusCode,
+              headers: { "content-type": "application/json; charset=utf-8" },
+            });
           } catch (_e) {
-            ddnsOp = { ok: false, error: "invalid encrypted token" };
+            ddnsOp = { ok: false, error: "invalid encrypted token or domain" };
           }
         }
       }
 
-      const result = {
+      // Build error response when early-terminated above
+      const fallback = {
         ok: !!platform && !!encToken && !!ddnsOp?.ok,
         platform: platform ?? null,
-        token_key_received: redactToken(encToken), // preview only (encrypted)
-        domain: domain ?? null,
+        token_key_received: redactToken(encToken ?? null),
+        domain: null,
         decisions: { ipv4: ipv4Choice, ipv6: ipv6Choice },
         ddns_op: ddnsOp,
         client: {
@@ -345,14 +377,13 @@ export default {
         },
       };
 
-      // Inherit provider HTTP status when present
-      const statusCode = ddnsOp?.providerStatus ?? (result.ok ? 200 : 400);
-
-      return new Response(JSON.stringify(result, null, 2), {
+      const statusCode = ddnsOp?.providerStatus ?? (fallback.ok ? 200 : 400);
+      return new Response(JSON.stringify(fallback, null, 2), {
         status: statusCode,
         headers: { "content-type": "application/json; charset=utf-8" },
       });
     }
+
 
     // --- Default: show brief help (plain text) ---
     const platforms = Object.keys(HANDLERS).join(", ");
@@ -360,9 +391,9 @@ export default {
       "DDNS bridge",
       "",
       "Endpoints:",
-      "  GET /encrypt?token=<RAW_DDNS_TOKEN>           -> returns encrypted token (text/plain)",
-      "  GET /decrypt?encrypted=<ENCRYPTED_TOKEN>      -> returns JSON { code, decrypted, msg? }",
-      "  GET /update?platform=<name>&domain=<d>&token=<ENCRYPTED_TOKEN>&[ip=<v4|''>]&[ipv6=<v6|''>]",
+      "  GET /encrypt?raw=<RAW_DATA>&uuid=<UUID>         -> returns encrypted data (text/plain)",
+      "  GET /decrypt?encrypted=<ENCRYPTED_DATA>         -> returns JSON { code, decrypted, msg? }",
+      "  GET /update?platform=<name>&domain=<ENCRYPTED_DOMAIN>&token=<ENCRYPTED_TOKEN>&[ip=<v4|''>]&[ipv6=<v6|''>]",
       "",
       "Notes:",
       "  - 'ip' / 'ipv6': omit to keep, empty string ('') to use CF-Connecting-IP, or provide explicit value.",
