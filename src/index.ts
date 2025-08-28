@@ -369,8 +369,11 @@ export default {
       "  - Both families cannot be auto ('') at the same time.",
       `  - Allowed platforms: ${platforms}`,
       "",
-      "OpenWrt custom URL:",
-      `  ${url.protocol}://${url.host}/update?platform=[USERNAME]&domain=[DOMAIN]&token=[PASSWORD]&ipv6=[IP]`
+      "OpenWrt custom URL (IPv6):",
+      `  ${url.protocol}//${url.host}/update?platform=[USERNAME]&domain=[DOMAIN]&token=[PASSWORD]&ipv6=[IP]`,
+      "",
+      "OpenWrt custom URL (IPv4):",
+      `  ${url.protocol}//${url.host}/update?platform=[USERNAME]&domain=[DOMAIN]&token=[PASSWORD]&ip=[IP]`,
     ].join("\n");
 
     return new Response(help, {
